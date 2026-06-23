@@ -227,8 +227,6 @@ class env(Environment):
             # 姿态
             ang+=((self.plp[1].p[0]-self.plp[0].p[0])*self.plumb[0]\
                 +(self.plp[1].p[1]-self.plp[0].p[1])*self.plumb[1])/distant(self.plp[0],self.plp[1])
-            # 能量消耗
-            energy+=sum([abs(m.activation) for m in self.creatures[0].muscles])/len(self.creatures[0].muscles)
             # 平滑性
             smooth+=sum([abs(i.a[0])+abs(i.a[1]) for i in self.creatures[0].phys])/len(self.creatures[0].phys)
 
@@ -239,7 +237,8 @@ class env(Environment):
         # 姿态惩罚（加强）
         self.r-=max(0,1-ang/30)*0.5
 
-        # 能量效率惩罚
+        # 能量效率惩罚（用肌肉长度变化表示）
+        energy=sum([abs(m.x-m.originx) for m in self.creatures[0].muscles])/len(self.creatures[0].muscles)
         self.r-=energy*0.0005
 
         # 平滑性惩罚

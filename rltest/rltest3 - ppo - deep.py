@@ -218,18 +218,36 @@ class env(Environment):
     def step(self,t): # reward
         v=0
         ang=0
-        std=0.23#0.668930899
-        mean=0.069#0.103502928
+        energy=0
+        smooth=0
         for i in range(30):
             super().step(t)
+            # 速度
             v+=sum([i.v[0] for i in self.creatures[0].phys])/len(self.creatures[0].phys)
+            # 姿态
             ang+=((self.plp[1].p[0]-self.plp[0].p[0])*self.plumb[0]\
                 +(self.plp[1].p[1]-self.plp[0].p[1])*self.plumb[1])/distant(self.plp[0],self.plp[1])
-        self.r=(v**0.5/90 if v>1 else 0)
+            # 能量消耗
+            energy+=sum([abs(m.activation) for m in self.creatures[0].muscles])/len(self.creatures[0].muscles)
+            # 平滑性
+            smooth+=sum([abs(i.a[0])+abs(i.a[1]) for i in self.creatures[0].phys])/len(self.creatures[0].phys)
+
+        # 前进奖励（降低阈值，早期更容易获得）
+        self.r=min(v/30,2.0)
         self.ang=ang
-        self.r+=-math.acos(ang/30)/math.pi
-        self.r=(self.r-mean)/std/3
-        self.r-=10 if self.isend(3) else 0
+
+        # 姿态惩罚（加强）
+        self.r-=max(0,1-ang/30)*0.5
+
+        # 能量效率惩罚
+        self.r-=energy*0.0005
+
+        # 平滑性惩罚
+        self.r-=smooth*0.0001
+
+        # 摔倒惩罚（加强）
+        if self.isend(3):
+            self.r-=15
 
     def test(self,times=10):
         for t in range(times):

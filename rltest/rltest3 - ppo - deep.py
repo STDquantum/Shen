@@ -1,7 +1,7 @@
 from Shen import *
 from wuli import *
 from creature import *
-import os,time
+import os,time,subprocess
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -293,6 +293,7 @@ def train_worker(queue):
     ek=0.5
     ae=0.3
     best_r=-float('inf')
+    save_count=0
 
     while True:
         try:
@@ -306,6 +307,16 @@ def train_worker(queue):
 
         torch.save(m.state_dict(),f"{savename}_policy.pth")
         torch.save(mv.state_dict(),f"{savename}_value.pth")
+        save_count+=1
+        if save_count%500==0:
+            print(f"[git] {save_count} saves, pushing to main...")
+            try:
+                subprocess.run(["git","add",f"{savename}_policy.pth",f"{savename}_value.pth"],cwd=os.path.dirname(os.path.abspath(__file__))+ "/..",check=True)
+                subprocess.run(["git","commit","-m",f"checkpoint {save_count}"],cwd=os.path.dirname(os.path.abspath(__file__))+ "/..",check=True)
+                subprocess.run(["git","push","origin","main"],cwd=os.path.dirname(os.path.abspath(__file__))+ "/..",check=True)
+                print("[git] push done")
+            except subprocess.CalledProcessError as ex:
+                print(f"[git] push failed: {ex}")
 
         if r>best_r:
             best_r=r

@@ -2,36 +2,164 @@ from Shen import *
 from wuli import *
 from creature import *
 import os,time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import multiprocessing as mp
 
-def mase(x,y):
+# ==================== PyTorch 模型 ====================
+
+class model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.f1=nn.Linear(statnum,30)
+        self.fh=nn.ModuleList([nn.Linear(30,30) for i in range(6)])
+        self.f2=nn.Linear(30,musclenum*2)
+
+    def forward(self,x):
+        x=torch.relu(self.f1(x))
+        for layer in self.fh:
+            x=x+torch.relu(layer(x))
+        x=self.f2(x)
+        chunks=x.split(2)
+        return torch.cat([torch.softmax(c,dim=-1) for c in chunks])
+
+    def choice(self,ten):
+        """接受 Ten 对象（兼容 env.getstat()），返回动作列表"""
+        with torch.no_grad():
+            probs=self(torch.tensor(ten.data,dtype=torch.float32)).numpy().tolist()
+        a=[]
+        for i in range(0,len(probs),2):
+            a.append(random.choices([0,1],weights=probs[i:i+2])[0])
+        return a
+
+class modelv(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.f1=nn.Linear(statnum,30)
+        self.fh=nn.ModuleList([nn.Linear(30,30) for i in range(6)])
+        self.f2=nn.Linear(30,1)
+
+    def forward(self,x):
+        x=torch.relu(self.f1(x))
+        for layer in self.fh:
+            x=x+torch.relu(layer(x))
+        return self.f2(x)
+
+# ==================== 经验回放 ====================
+
+class memory:
+    def __init__(self,maxsize=10):
+        self.memo=[]
+        self.maxsize=maxsize
+
+    def experience(self,m,times=3,n=500):
+        for t in range(times):
+            e=env()
+            exp=[]
+            ar=0
+            for i in range(n):
+                s_ten=e.getstat()
+                s=torch.tensor(s_ten.data,dtype=torch.float32)
+                with torch.no_grad():
+                    v=m(s).numpy().tolist()
+                a=[]
+                p=[]
+                for j in range(0,len(v),2):
+                    probs=v[j:j+2]
+                    action=random.choices([0,1],weights=probs)[0]
+                    a.append(action)
+                    p.append(probs[action])
+                e.act(a)
+                e.step(0.001)
+                st_ten=e.getstat()
+                st=torch.tensor(st_ten.data,dtype=torch.float32)
+                r=e.reward()
+                ar+=r
+                exp.append([s,a,r,st,0,p])
+                if i==n-1 or e.isend():
+                    exp[-1][4]=1
+                    break
+            self.memo.append(exp)
+        if len(self.memo)>self.maxsize:
+            self.memo=self.memo[-self.maxsize:]
+        return ar/times
+
+# ==================== 训练函数 ====================
+
+def mase_torch(x,y):
     a=((x-y)**2).sum()
-    if a.data[0]<1:
+    if a.item()<1:
         return a
     else:
-        return a**0.5
+        return torch.sqrt(a)
 
-def entropy(x):
-    return Ten([-1]).expand(len(x))*x*x.log()
+def train(m,mv,opt_m,opt_mv,memo,n=200,times=1,discount=0.99,lamb=0.99,ek=0.5,eps=0.2):
+    t0=time.perf_counter()
+    ar=memo.experience(m,times,n=n)
+    t1=time.perf_counter()
+    aloss=0
+    alossv=0
+    alosse=0
+    alratio=0
+    count=0
 
-def clip(x,maxx,minx):
-    p=[]
-    for i in range(len(x)):
-        if x.data[i]>maxx:
-            p.append(Ten([maxx]))
-        elif x.data[i]<minx:
-            p.append(Ten([minx]))
-        else:
-            p.append(x.cut(i,i+1))
-    return Ten.connect(p)
+    opt_m.zero_grad()
+    opt_mv.zero_grad()
 
-def minten(x,y):
-    p=[]
-    for i in range(len(x)):
-        if x.data[i]<=y.data[i]:
-            p.append(x.cut(i,i+1))
-        else:
-            p.append(y.cut(i,i+1))
-    return Ten.connect(p)
+    for exp in memo.memo:
+        ad=[]
+        gae=0
+        for i in range(len(exp)-1,-1,-1):
+            with torch.no_grad():
+                v=mv(exp[i][0]).item()
+                v2=mv(exp[i][3]).item()
+            tdd=exp[i][2]+discount*v2*(1-exp[i][4])-v
+            gae=tdd+lamb*discount*gae*(1-exp[i][4])
+            ad.append(gae)
+        ad.reverse()
+
+        for idx,(s,a,r,st,end,p) in enumerate(exp):
+            out=m(s)
+            pc=torch.cat([out[a[j]+j*2:a[j]+j*2+1] for j in range(len(a))])
+            ent=(-out*torch.log(out+1e-8)).sum()
+            v_pred=mv(s)
+            adv=torch.tensor([ad[idx]],dtype=torch.float32)
+            p_tensor=torch.tensor(p,dtype=torch.float32)
+
+            ratio=torch.exp(torch.log(pc+1e-8)-torch.log(p_tensor+1e-8))
+            surr=ratio*adv.expand(len(pc))
+            surr2=torch.clamp(ratio,1-eps,1+eps)*adv.expand(len(pc))
+            loss=-torch.min(surr,surr2).sum()
+            losse=-ek*ent
+
+            (loss+losse).backward()
+
+            target=torch.tensor([ad[idx]-v_pred.item()],dtype=torch.float32)
+            lossv=mase_torch(v_pred,target)
+            lossv.backward()
+
+            aloss+=loss.item()/len(pc)
+            alosse+=ent.item()/len(out)
+            alratio+=torch.abs(ratio-1).mean().item()
+            alossv+=lossv.item()
+            count+=1
+
+    for p in m.parameters():
+        if p.grad is not None:
+            p.grad/=count
+    for p in mv.parameters():
+        if p.grad is not None:
+            p.grad/=count
+
+    opt_m.step()
+    opt_mv.step()
+
+    t2=time.perf_counter()
+    print(ar,aloss/count,alossv/count,alosse/count,alratio/count,t1-t0,t2-t1)
+    return ar,aloss/count,alossv/count,alosse/count
+
+# ==================== 环境（保持不变） ====================
 
 class env(Environment):
     def __init__(self):
@@ -89,51 +217,26 @@ class env(Environment):
 
     def step(self,t): # reward
         v=0
-        v2=0
-        p=0
         ang=0
         std=0.23#0.668930899
         mean=0.069#0.103502928
         for i in range(30):
             super().step(t)
-            # p+=sum([i.p[1] for i in self.creatures[0].phys])/len(self.creatures[0].phys)
-            # v2+=sum([i.v[1] for i in self.creatures[0].phys])/len(self.creatures[0].phys)
             v+=sum([i.v[0] for i in self.creatures[0].phys])/len(self.creatures[0].phys)
             ang+=((self.plp[1].p[0]-self.plp[0].p[0])*self.plumb[0]\
                 +(self.plp[1].p[1]-self.plp[0].p[1])*self.plumb[1])/distant(self.plp[0],self.plp[1])
-            # p-=sum([1 if (i.x>=i.originx*i.maxl or i.x<=i.originx*i.minl) else 0 for i in self.creatures[0].muscles])*10
         self.r=(v**0.5/90 if v>1 else 0)
-        # self.r=max(0,v)/30#/120+0.05 
-        # self.r=0
-        
-        # self.r+=-max(0,math.acos(ang/30)-math.acos(self.ang/30))/math.pi
-        # self.r*=1-(math.acos(ang/30))/math.pi
         self.ang=ang
-        # self.r-=(-v2)**0.5/90 if v2<0 else 0
-        # self.r=(0.3 if v>1 else 0)-(10 if self.isend(3) else 0)
-        # pos=sum([i.p[0] for i in self.creatures[0].phys])/len(self.creatures[0].phys)
-        # self.r=0
-        # if pos>self.flag:
-        #     self.r=(pos-self.flag)
-        #     self.flag=pos
-        
         self.r+=-math.acos(ang/30)/math.pi
         self.r=(self.r-mean)/std/3
         self.r-=10 if self.isend(3) else 0
 
-        # r9=max(0,v)/30
-        # (self.r-mean=20.3)/std=30.9/3
-
-        # r10=max(0,v)/30/120+0.05
-
-        # print(self.r)
-    
     def test(self,times=10):
         for t in range(times):
             e=env()
             ar=0
             for i in range(n):
-                e.act([random.randint(0,1) for i in range(musclenum)]) #[0,1] if e.creatures[0].phys[3].p[0]<0 else [1,0]
+                e.act([random.randint(0,1) for i in range(musclenum)])
                 e.step(0.001)
                 ar+=e.reward()
                 p=0
@@ -153,162 +256,14 @@ class env(Environment):
                 print(e.reward(),p,v,a,m)
                 if e.isend():
                     break
-    
-    def isend(self,h=1):  
+
+    def isend(self,h=1):
         for i in self.creatures[0].phys:
             if i not in self.foot and i.p[1]<h+self.ground:
-                # 如果身体着地停止训练
                 return True
         return False
 
-class model:
-    def __init__(self):
-        self.f1=Linear(statnum, 30)
-        self.fh=[Linear(30,30) for i in range(6)]
-        self.f2=Linear(30,musclenum*2)
-
-    def forward(self,x):
-        x=self.f1(x).relu()
-        for i in self.fh:
-            x+=i(x).relu()
-        x=self.f2(x)
-        x=Ten.connect([x.cut(i*2,i*2+2).softmax() for i in range(len(x)//2)])
-        return x
-
-    def choice(self,x):
-        v = self.forward(x).data
-        a=[]
-        # print(v)
-        for i in range(len(v)):
-            if i%2==1:
-                continue
-            v2=v[i:i+2]
-            a.append(v2.index(random.choices(v2,v2)[0]))
-        Operator.clean()
-        return a
-
-    def optimize(self,k=0.01):
-        self.f1.grad_descent_zero(k)
-        for i in self.fh:
-            i.grad_descent_zero(k)
-        self.f2.grad_descent_zero(k)
-
-class modelv:
-    def __init__(self):
-        self.f1=Linear(statnum, 30)
-        self.fh=[Linear(30,30) for i in range(6)]
-        self.f2=Linear(30,1)
-
-    def forward(self,x):
-        x=self.f1(x).relu()
-        for i in self.fh:
-            x+=i(x).relu()
-        x=self.f2(x)
-        return x
-
-    def optimize(self,k=0.01):
-        self.f1.grad_descent_zero(k)
-        for i in self.fh:
-            i.grad_descent_zero(k)
-        self.f2.grad_descent_zero(k)
-
-class memory:
-    def __init__(self,maxsize=10):
-        self.memo=[]
-        self.maxsize=maxsize
-    
-    def experience(self,m,times=3,n=500):
-        for t in range(times):
-            e=env()
-            exp=[]
-            ar=0
-            for i in range(n):
-                s=e.getstat()
-                v = m.forward(s).data
-                a=[]
-                p=[]
-                for j in range(len(v)):
-                    if j%2==1:
-                        continue
-                    v2=v[j:j+2]
-                    a.append(v2.index(random.choices(v2,v2)[0]))
-                    p.append(v2[a[-1]])
-                Operator.clean()
-                e.act(a)
-                e.step(0.001)
-                st=e.getstat()
-                r=e.reward()
-                ar+=r
-                exp.append([s,a,r,st,0,p])
-                if i==n-1 or e.isend():
-                    exp[-1][4]=1
-                    break
-            self.memo.append(exp)
-        if len(self.memo)>self.maxsize:
-            self.memo=self.memo[-self.maxsize:]
-        return ar/times
-
-def train(m, mv, memo, n=200, times=1,discount=0.99,lamb=0.99, ek=0.5,eps=0.2):
-    t0=time.perf_counter()
-    ar=memo.experience(m,times,n=n)
-    t1=time.perf_counter()
-    aloss=0
-    alossv=0
-    aloss=0
-    alossv=0
-    alosse=0
-    alratio=0
-    count=0
-    for exp in memo.memo:
-        c=0
-        ad=[]
-        gae=0
-        for i in range(len(exp)-1,-1,-1):
-            v=mv.forward(exp[i][0]).data[0]
-            v2=mv.forward(exp[i][3]).data[0]
-            tdd=exp[i][2]+discount*v2*(1-exp[i][4])-v
-            gae=tdd+lamb*discount*gae*(1-exp[i][4])
-            ad.append(gae)
-            Operator.clean()
-        ad.reverse()
-        # mean=sum(ad)/len(ad)
-        # std=sum([(a-mean)**2 for a in ad])**0.5
-        
-        for i in exp:
-            s,a,r,st,end,p=i
-            out=m.forward(s)
-            pc=Ten.connect([out.cut(a[j]+j*2,a[j]+j*2+1) for j in range(len(a))])
-            # ent=Ten.connect([entropy(out.cut(j*2,j*2+1))+entropy(out.cut(1+j*2,1+j*2+1)) for j in range(len(a))])
-            ent=entropy(out).sum()
-            v=mv.forward(s)
-            adv=Ten([ad[c]])
-
-            ratio=(pc.log()-Ten(p).log()).exp()
-            surr=ratio*adv.expand(len(pc))
-            surr2=clip(ratio,1+eps,1-eps)*adv.expand(len(pc))
-            
-            loss=Ten([-1]).expand(len(pc))*(minten(surr,surr2))#+Ten([-ek]).expand(len(pc))*ent
-            loss.onegrad()
-            losse=Ten([-ek])*ent
-            losse.onegrad()
-            
-            aloss+=sum([i for i in loss.data])/len(loss)
-            alosse+=ent.data[0]/len(out)
-            alratio+=sum([abs(i-1) for i in ratio.data])/len(loss)
-            lossv=mase(v,Ten((adv-v).data))
-            alossv+=lossv.data[0]
-            # if abs(lossv.data[0]) > 80:
-            #     print(f"loss-v{lossv.data[0]},梯度过高")
-            #     Operator.clean()
-            #     continue
-            Operator.back()
-            count+=1
-            c+=1
-    m.optimize(0.0008/count)#0.0005
-    mv.optimize(0.0008/count)
-    t2=time.perf_counter()
-    print(ar,aloss/count,alossv/count,alosse/count,alratio/count,t1-t0,t2-t1)
-    return ar,aloss/count,alossv/count,alosse/count
+# ==================== 初始化 ====================
 
 evnname="box2"
 lastname="-deep-r11"
@@ -318,40 +273,73 @@ musclenum=sum([len(i.muscles) for i in e.creatures])
 ground=e.ground
 del e
 savename=f"rlt-3-ppo-{evnname}{lastname}"
-if savename in os.listdir():
-    print("load",savename)
-    Layer.loadall(savename)
-m=model()
-mv=modelv()
-memo=memory(2)
-Layer.issave=False
 n=500   # 一轮训练的最大回合数
+mode=1  # =1训练+显示，=0仅显示
 
-mode=0  # =1训练，=0测试模型
-ek=0.5
-ae=0.3
-while True:
-    if mode:
+# ==================== 训练子进程 ====================
+
+def train_worker(queue):
+    """训练子进程：持续训练并发送最佳模型到主进程"""
+    m=model()
+    mv=modelv()
+    if os.path.exists(f"{savename}_policy.pth"):
+        print("load",savename)
+        m.load_state_dict(torch.load(f"{savename}_policy.pth",weights_only=True))
+        mv.load_state_dict(torch.load(f"{savename}_value.pth",weights_only=True))
+
+    opt_m=optim.Adam(m.parameters(),lr=0.001)
+    opt_mv=optim.Adam(mv.parameters(),lr=0.001)
+    memo=memory(2)
+    ek=0.5
+    ae=0.3
+    best_r=-float('inf')
+
+    while True:
         try:
-            # ek=min(max(ek*2 if ae<0.2 else ek/2 if ae>0.33 else ek,0.1),3)
             ek=2 if ae<0.2 else 0.5
-            r,al,av,ae=train(m,mv,memo,discount=0.98,ek=ek,n=n)
-        except OverflowError:
+            r,al,av,ae=train(m,mv,opt_m,opt_mv,memo,discount=0.98,ek=ek,n=n)
+        except (OverflowError,ZeroDivisionError,RuntimeError) as ex:
             r=0
-            print("OverflowError")
+            print(ex)
             memo.memo=[]
-            Operator.clean()
-            pass
-        except ZeroDivisionError:
-            r=0
-            print("ZeroDivisionError")
-            memo.memo=[]
-            Operator.clean()
-            pass
-        Layer.saveall(savename)
-    else:
-        e=env()
-        e.show(m)
+            continue
 
-# e=env()
-# e.test()
+        torch.save(m.state_dict(),f"{savename}_policy.pth")
+        torch.save(mv.state_dict(),f"{savename}_value.pth")
+
+        if r>best_r:
+            best_r=r
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except:
+                    break
+            queue.put(m.state_dict())
+
+# ==================== 主进程 ====================
+
+if __name__=='__main__':
+    if mode:
+        ctx=mp.get_context('spawn')
+        queue=ctx.Queue(maxsize=2)
+        p_train=ctx.Process(target=train_worker,args=(queue,))
+        p_train.start()
+
+        # 主进程：显示最佳模型动画
+        m=model()
+        while True:
+            try:
+                new_weights=queue.get_nowait()
+                m.load_state_dict(new_weights)
+                print("[display] updated best model")
+            except:
+                pass
+            e=env()
+            e.show(m)
+    else:
+        m=model()
+        if os.path.exists(f"{savename}_policy.pth"):
+            m.load_state_dict(torch.load(f"{savename}_policy.pth",weights_only=True))
+        while True:
+            e=env()
+            e.show(m)

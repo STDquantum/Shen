@@ -218,7 +218,6 @@ class env(Environment):
     def step(self,t): # reward
         v=0
         ang=0
-        energy=0
         smooth=0
         for i in range(30):
             super().step(t)
@@ -230,23 +229,23 @@ class env(Environment):
             # 平滑性
             smooth+=sum([abs(i.a[0])+abs(i.a[1]) for i in self.creatures[0].phys])/len(self.creatures[0].phys)
 
-        # 前进奖励（降低阈值，早期更容易获得）
-        self.r=min(v/30,2.0)
-        self.ang=ang
+        # 位移奖励（直接奖励前进距离，鼓励大步走）
+        dx=self.creatures[0].phys[0].p[0]-self.last_x if hasattr(self,'last_x') else 0
+        self.r=dx*0.5
+        self.last_x=self.creatures[0].phys[0].p[0]
 
-        # 姿态惩罚（加强）
-        self.r-=max(0,1-ang/30)*0.5
+        # 速度奖励（额外奖励快速移动）
+        self.r+=min(v/10,3.0)
 
-        # 能量效率惩罚（用肌肉长度变化表示）
-        energy=sum([abs(m.x-m.originx) for m in self.creatures[0].muscles])/len(self.creatures[0].muscles)
-        self.r-=energy*0.0005
+        # 姿态惩罚（减轻，允许更大胆的动作）
+        self.r-=max(0,1-ang/30)*0.2
 
-        # 平滑性惩罚
-        self.r-=smooth*0.0001
+        # 平滑性惩罚（减轻）
+        self.r-=smooth*0.00005
 
-        # 摔倒惩罚（加强）
+        # 摔倒惩罚（减轻，鼓励探索）
         if self.isend(3):
-            self.r-=15
+            self.r-=8
 
     def test(self,times=10):
         for t in range(times):
